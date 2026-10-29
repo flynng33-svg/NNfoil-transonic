@@ -59,7 +59,10 @@ class NNfoil():
         self.model = Net(self.layers, self.XE, self.device).to(self.device)
 
         #Obtain airfoil by cst (True) or mesh (False) ? if True, use mesh deformation based on the read mesh.
-        self.use_cst = False  
+        self.use_cst = False
+
+        # PDE residual form: True = conservative (flux divergence), False = Cao's original primitive form
+        self.conservative = True
         #NACA0012
         b_up = [0.171787,0.155338,0.161996,0.137638,0.145718,0.143815]
         b_down = [-0.171787,-0.155338,-0.161996,-0.137638,-0.145718,-0.143815]
@@ -169,40 +172,56 @@ class NNfoil():
         
         return mseb1 + mseb2 + mseb3
 
-    def Msef(self):
+    def phys_grad(self, f, XE):
+        # d f / d(x,y) from d f / d(xi,eta) via the inverse mesh metrics
+        f_xieta = fwd_gradients(f, XE)
+        return (self.Jac_inv[self.batch_ind]@f_xieta.reshape(-1,2,1)).squeeze()
 
-        XE = self.XE[self.batch_ind]
-        XE.requires_grad = True
+    def Residuals(self, XE=None):
+        # Returns the four residuals (n,4). Form is selected by self.conservative:
+        #   True : divergence of the Euler fluxes (mass, x-mom, y-mom, total energy)
+        #   False: original primitive-variable form (Cao et al.)
+        if XE is None:
+            XE = self.XE[self.batch_ind]
+            XE.requires_grad = True
         pred = self.model(XE)
         u = pred[:,0:1]; v = pred[:,1:2]; p = pred[:,2:3]; rho = pred[:,3:4]
-        gamma = 1.4;
-        u_xieta = fwd_gradients(u, XE)
-        v_xieta = fwd_gradients(v, XE)
-        p_xieta = fwd_gradients(p, XE)
-        rho_xieta = fwd_gradients(rho, XE)
-        
-        u_xy = (self.Jac_inv[self.batch_ind]@u_xieta.reshape(-1,2,1)).squeeze()
-        v_xy = (self.Jac_inv[self.batch_ind]@v_xieta.reshape(-1,2,1)).squeeze()
-        p_xy = (self.Jac_inv[self.batch_ind]@p_xieta.reshape(-1,2,1)).squeeze()
-        rho_xy = (self.Jac_inv[self.batch_ind]@rho_xieta.reshape(-1,2,1)).squeeze()
-        
+        gamma = 1.4
+
+        # first derivatives of the four network outputs (4 autograd calls, shared by both forms)
+        u_xy = self.phys_grad(u, XE); v_xy = self.phys_grad(v, XE)
+        p_xy = self.phys_grad(p, XE); rho_xy = self.phys_grad(rho, XE)
         u_x = u_xy[:,0:1]; u_y = u_xy[:,1:2]
         v_x = v_xy[:,0:1]; v_y = v_xy[:,1:2]
         p_x = p_xy[:,0:1]; p_y = p_xy[:,1:2]
         rho_x = rho_xy[:,0:1]; rho_y = rho_xy[:,1:2]
-        
+
+        if self.conservative:
+            # d(Fx)/dx + d(Fy)/dy, with the flux derivatives expanded by the product rule from the
+            # primitive gradients above (same cost as the primitive form, no extra autograd passes).
+            # Fx = (rho u, rho u^2 + p, rho u v, u(rhoE+p)),  Fy = (rho v, rho u v, rho v^2 + p, v(rhoE+p))
+            # rhoE = p/(gamma-1) + rho (u^2+v^2)/2
+            q2 = u**2 + v**2
+            H = p/(gamma-1) + 0.5*rho*q2 + p                       # rhoE + p
+            H_x = p_x/(gamma-1) + 0.5*rho_x*q2 + rho*(u*u_x + v*v_x) + p_x
+            H_y = p_y/(gamma-1) + 0.5*rho_y*q2 + rho*(u*u_y + v*v_y) + p_y
+            R1 = (rho_x*u + rho*u_x) + (rho_y*v + rho*v_y)
+            R2 = (rho_x*u**2 + 2*rho*u*u_x + p_x) + (rho_y*u*v + rho*u_y*v + rho*u*v_y)
+            R3 = (rho_x*u*v + rho*u_x*v + rho*u*v_x) + (rho_y*v**2 + 2*rho*v*v_y + p_y)
+            R4 = (u_x*H + u*H_x) + (v_y*H + v*H_y)
+            return torch.cat([R1, R2, R3, R4], dim=1)
+
         a2 = gamma*p/rho
         e1 = rho*u_x + u*rho_x + rho*v_y + v*rho_y
         e2 = u*u_x + v*u_y + 1/rho*p_x
         e3 = u*v_x + v*v_y + 1/rho*p_y
         e4 = rho*a2*u_x +  rho*a2*v_y + u*p_x + v*p_y
-        R = torch.stack([e1, e2, e3, e4], dim=2).view(u.shape[0], 4, 1)
+        return torch.cat([e1, e2, e3, e4], dim=1)
 
-        R_pre = R.squeeze()
-
-        res_rho = R_pre[:,0:1]; res_u = R_pre[:,1:2]; res_v = R_pre[:,2:3]; res_p = R_pre[:,3:4];
-        msef = ((res_rho**2 + res_u**2 + res_v**2 + res_p**2)*self.J[self.batch_ind]**2).sum() / (self.J[self.batch_ind]**2).sum()
-        
+    def Msef(self):
+        R = self.Residuals()
+        J2 = self.J[self.batch_ind]**2
+        msef = ((R**2).sum(1, keepdim=True)*J2).sum() / J2.sum()
         return msef
 
     def Calculate_Force(self):
